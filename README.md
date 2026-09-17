@@ -48,12 +48,21 @@ so the table can grow.
 
 ## Install
 
+Install straight from this repository. No marketplace listing is needed:
+
 ```sh
 omarchy plugin add https://github.com/kristoferlund/omarchy-bose-headphones.git --enable
 ```
 
-Then pair and connect your headphones as usual (for example from the Omarchy Bluetooth panel).
-The widget finds the first connected Bose device on its own.
+Omarchy shows a warning that plugins run unsandboxed and asks you to confirm. Then pair and
+connect your headphones as usual (for example from the Omarchy Bluetooth panel); the widget finds
+the first connected Bose device on its own.
+
+To update to the latest version later:
+
+```sh
+omarchy plugin update io.github.kristoferlund.bose
+```
 
 **Requirements:** Omarchy Quattro and Bose headphones that are paired and connected. Nothing else
 to install: the plugin needs only Python 3 (standard library) and BlueZ, and a standard Omarchy

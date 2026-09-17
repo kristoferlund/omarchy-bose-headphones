@@ -48,7 +48,6 @@ so the table can grow.
 
 ## Install
 
-Install straight from this repository. No marketplace listing is needed:
 
 ```sh
 omarchy plugin add https://github.com/kristoferlund/omarchy-bose-headphones.git --enable

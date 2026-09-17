@@ -1,0 +1,38 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.kristoferlund.bose",
+  "name": "Bose Headphones",
+  "version": "0.1.0",
+  "author": "Kristofer Lund",
+  "license": "MIT",
+  "description": "Control Bose headphones from the Omarchy bar: switch, edit, create and delete modes, EQ and headset settings.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Bose Headphones",
+    "description": "Modes, noise cancelling, EQ and settings for Bose headphones over Bluetooth.",
+    "category": "Audio",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "schema": [
+      {
+        "key": "address",
+        "type": "string",
+        "label": "Headset address",
+        "description": "Bluetooth address of the headset. Leave empty to use the first connected Bose device.",
+        "defaultValue": ""
+      },
+      {
+        "key": "announceModes",
+        "type": "boolean",
+        "label": "Announce mode changes",
+        "description": "Play the headset's voice prompt when switching modes from the bar, like the headset button does.",
+        "defaultValue": true
+      }
+    ]
+  }
+}

@@ -1,0 +1,654 @@
+#!/usr/bin/env python3
+"""bosectl — control Bose headphones from Linux over BMAP."""
+
+import argparse
+import contextlib
+import fcntl
+import hashlib
+import io
+import json
+import os
+import queue
+import re
+import signal
+import socket
+import subprocess
+import sys
+import threading
+import time
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+
+from bmap import (APP_ICONS, BUTTON_ACTIONS, EQ_BANDS, LANGUAGES, PROMPTS, SIDETONE, SPATIAL,  # noqa: E402
+                  Bose, BmapError, ConnectionLost)
+
+BOSE_VENDOR = "v009E"
+CACHE_DIR = os.path.join(os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache")), "bosectl")
+
+
+MISSING_BLUEZ = "bluetoothctl not found; install BlueZ with: sudo pacman -S --needed bluez bluez-utils"
+
+
+def bluetoothctl(*args):
+    try:
+        return subprocess.run(["bluetoothctl", *args], capture_output=True, text=True, timeout=10).stdout
+    except FileNotFoundError:
+        raise BmapError(MISSING_BLUEZ) from None
+    except subprocess.TimeoutExpired:
+        raise BmapError("bluetoothctl did not respond; is the bluetooth service running?") from None
+
+
+def find_headset():
+    """Address of the first connected Bluetooth device with Bose's vendor id."""
+    out = bluetoothctl("devices", "Connected")
+    for addr in re.findall(r"Device ([0-9A-F:]{17})", out):
+        info = bluetoothctl("info", addr)
+        if f"bluetooth:{BOSE_VENDOR}" in info:
+            return addr
+    raise BmapError("no connected Bose headset found (use --address)")
+
+
+def cached_channel(addr):
+    try:
+        return int(open(os.path.join(CACHE_DIR, addr.replace(":", ""))).read())
+    except (OSError, ValueError):
+        return None
+
+
+def save_channel(addr, channel):
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    with open(os.path.join(CACHE_DIR, addr.replace(":", "")), "w") as f:
+        f.write(str(channel))
+
+
+def on_off(value):
+    if value.lower() in ("on", "true", "1", "yes"):
+        return True
+    if value.lower() in ("off", "false", "0", "no"):
+        return False
+    raise argparse.ArgumentTypeError("expected on/off")
+
+
+def public(mode):
+    return {k: v for k, v in mode.items() if not k.startswith("_")}
+
+
+def emit(args, data, text=None):
+    if args.json:
+        print(json.dumps(data, indent=2))
+    elif text is not None:
+        print(text)
+
+
+def mode_table(modes):
+    lines = [f"  {'#':<2} {'name':<14} {'icon':<9} {'type':<7} {'noise cancel':<13} {'wind':<5} spatial"]
+    for m in modes:
+        wind = {True: "on", False: "off", None: "-"}[m["wind_block"]]
+        nc = f"{m['noise_cancel']}/{m['noise_cancel_max']}"
+        lines.append(f"{'*' if m['active'] else ' '} {m['index']:<2} {m['name']:<14} {m['icon']:<9} "
+                     f"{'custom' if m['custom'] else 'preset':<7} {nc:<13} {wind:<5} {m['spatial'] or '-'}"
+                     f"{'  (default)' if m['default'] else ''}")
+    return "\n".join(lines)
+
+
+def add_mode_settings(p):
+    p.add_argument("--noise-cancel", type=int, metavar="N", help="0 (aware) … 10 (full cancelling)")
+    p.add_argument("--wind-block", type=on_off, metavar="on|off")
+    p.add_argument("--spatial", choices=SPATIAL)
+    p.add_argument("--auto-cnc", type=on_off, metavar="on|off")
+    p.add_argument("--anc-toggle", type=on_off, metavar="on|off")
+
+
+BOOL_SETTINGS = {"multipoint": 10, "cnc-persistence": 14, "motion-auto-off": 20, "flip-to-off": 22,
+                 "auto-play-pause": 24, "auto-answer": 27, "auto-aware": 29, "auto-volume": 32,
+                 "disable-touch": 34, "le-audio": 37}
+
+
+def build_parser():
+    ap = argparse.ArgumentParser(prog="bosectl", description=__doc__)
+    ap.add_argument("-a", "--address", help="headset Bluetooth address (default: first connected Bose device)")
+    ap.add_argument("-j", "--json", action="store_true", help="machine-readable output")
+    sub = ap.add_subparsers(dest="cmd", required=True, metavar="command")
+
+    sub.add_parser("status", help="device info, battery, modes and settings")
+    sub.add_parser("battery", help="battery level")
+    sub.add_parser("modes", help="list audio modes (profiles)")
+
+    p = sub.add_parser("mode", help="show or switch the active mode")
+    p.add_argument("name", nargs="?", help="mode name or index")
+    p.add_argument("--prompt", action="store_true", help="play the headset voice prompt")
+
+    p = sub.add_parser("mode-edit", help="change settings of a mode")
+    p.add_argument("name", help="mode name or index")
+    p.add_argument("--rename", metavar="NAME", help="new name (custom modes only)")
+    p.add_argument("--icon", choices=PROMPTS[1:], help="icon/voice prompt (custom modes only)")
+    add_mode_settings(p)
+
+    p = sub.add_parser("mode-create", help="create a custom mode in a free slot")
+    p.add_argument("name")
+    p.add_argument("--icon", choices=PROMPTS[1:], required=True)
+    add_mode_settings(p)
+
+    sub.add_parser("mode-delete", help="delete a custom mode").add_argument("name", help="mode name or index")
+    sub.add_parser("mode-default", help="set the mode used at power-on").add_argument("name")
+
+    p = sub.add_parser("set", help="change a headset setting")
+    s = p.add_subparsers(dest="setting", required=True, metavar="setting")
+    s.add_parser("name", help="headset Bluetooth name").add_argument("value")
+    s.add_parser("noise-cancel", help="live noise cancel level of the active mode").add_argument("value", type=int)
+    q = s.add_parser("eq", help="equalizer band, e.g. 'set eq bass 3'")
+    q.add_argument("band", choices=EQ_BANDS)
+    q.add_argument("value", type=int)
+    s.add_parser("sidetone", help="hear your own voice on calls").add_argument("value", choices=SIDETONE)
+    q = s.add_parser("voice-prompts", help="headset voice prompts")
+    q.add_argument("value", type=on_off)
+    q.add_argument("--language", choices=LANGUAGES)
+    s.add_parser("auto-off", help="minutes idle before power off (0 = never)").add_argument("value", type=int)
+    s.add_parser("shortcut", help="shortcut button action").add_argument("value", choices=BUTTON_ACTIONS)
+    s.add_parser("mode-persistence", help="keep active mode across power cycles").add_argument("value", type=on_off)
+    s.add_parser("volume", help="headset volume").add_argument("value", type=int)
+    for name in BOOL_SETTINGS:
+        s.add_parser(name).add_argument("value", type=on_off)
+
+    sub.add_parser("devices", help="paired source devices")
+    for name, desc in (("connect", "connect a paired device"), ("disconnect", "disconnect a device"),
+                       ("forget", "remove a device from the headset's pairing list")):
+        sub.add_parser(name, help=desc).add_argument("device", help="Bluetooth address")
+    sub.add_parser("pairing", help="enter/leave pairing mode").add_argument("value", type=on_off)
+
+    p = sub.add_parser("watch", help="print headset state and changes as JSON lines")
+    p.add_argument("--no-daemon", action="store_true",
+                   help="connect directly instead of starting/using the background daemon")
+    sub.add_parser("daemon", help="hold the headset connection and serve other bosectl calls")
+    return ap
+
+
+def status_data(bose):
+    has_modes = bose.has_modes()
+    return {"device": bose.info(), "battery": bose.battery(),
+            "modes": [public(m) for m in bose.modes()],
+            "capabilities": bose.modes_capabilities() if has_modes else None,
+            "icon_choices": APP_ICONS,
+            "settings": bose.settings()}
+
+
+READ_ONLY = {"status", "battery", "modes", "devices", "watch", "daemon"}
+
+
+def run(args, bose):
+    cmd = args.cmd
+    if cmd == "status":
+        data = status_data(bose)
+        d = data["device"]
+        battery = " ".join(f"{b['percent']}%" for b in data["battery"]) or "unknown"
+        emit(args, data, f"{d['name']} ({d['product_id']}, fw {d['firmware']})\n"
+                         f"battery {battery}\n\n{mode_table(data['modes'])}\n\n"
+                         + json.dumps(data["settings"], indent=2))
+    elif cmd == "battery":
+        b = bose.battery()
+        emit(args, b, " ".join(f"{x['percent']}%" for x in b) or "unknown")
+    elif cmd == "modes":
+        modes = bose.modes()
+        emit(args, [public(m) for m in modes], mode_table(modes))
+    elif cmd == "mode":
+        modes = bose.modes()
+        if args.name:
+            bose.set_current_mode(bose.find_mode(args.name, modes)["index"], args.prompt)
+            modes = bose.modes()
+        active = next((m for m in modes if m["active"]), None)
+        emit(args, public(active) if active else None, active["name"] if active else "unknown")
+    elif cmd in ("mode-edit", "mode-create"):
+        kw = dict(noise_cancel=args.noise_cancel, wind_block=args.wind_block, spatial=args.spatial,
+                  auto_cnc=args.auto_cnc, anc_toggle=args.anc_toggle)
+        if cmd == "mode-edit":
+            index = bose.find_mode(args.name)["index"]
+            bose.edit_mode(index, name=args.rename, icon=args.icon, **kw)
+        else:
+            index = bose.create_mode(args.name, args.icon, **kw)["index"]
+        m = bose.find_mode(index)
+        emit(args, public(m), mode_table([m]))
+    elif cmd == "mode-delete":
+        m = bose.find_mode(args.name)
+        bose.delete_mode(m["index"])
+        emit(args, {"deleted": public(m)}, f"deleted {m['name']}")
+    elif cmd == "mode-default":
+        m = bose.find_mode(args.name)
+        bose.set_default_mode(m["index"])
+        emit(args, public(m), f"default mode: {m['name']}")
+    elif cmd == "set":
+        st = args.setting
+        if st in BOOL_SETTINGS:
+            bose.set_bool(BOOL_SETTINGS[st], args.value)
+        elif st == "name":
+            bose.set_name(args.value)
+        elif st == "noise-cancel":
+            bose.set_noise_cancel(args.value)
+        elif st == "eq":
+            bose.set_eq(args.band, args.value)
+        elif st == "sidetone":
+            bose.set_sidetone(args.value)
+        elif st == "voice-prompts":
+            bose.set_voice_prompts(args.value, args.language)
+        elif st == "auto-off":
+            bose.set_auto_off(args.value)
+        elif st == "shortcut":
+            bose.set_shortcut(args.value)
+        elif st == "mode-persistence":
+            bose.set_mode_persistence(args.value)
+        elif st == "volume":
+            bose.set_volume(args.value)
+        settings = bose.settings()
+        emit(args, settings, json.dumps(settings, indent=2))
+    elif cmd == "devices":
+        devs = bose.devices()
+        emit(args, devs, "\n".join(f"{'*' if d['connected'] else ' '} {d['address']}  {d['name'] or '?'}"
+                                   for d in devs))
+    elif cmd in ("connect", "disconnect", "forget"):
+        {"connect": bose.connect_device, "disconnect": bose.disconnect_device,
+         "forget": bose.remove_device}[cmd](args.device)
+        emit(args, bose.devices(), "ok")
+    elif cmd == "pairing":
+        bose.set_pairing_mode(args.value)
+        emit(args, {"pairing": args.value}, "ok")
+
+
+# ---------------------------------------------------------------- daemon
+#
+# The headset accepts a single RFCOMM connection. `bosectl daemon` holds it, subscribes to
+# change notifications, and serves other bosectl invocations over a Unix socket. Without a
+# running daemon, bosectl connects to the headset directly.
+
+
+def runtime_dir():
+    path = os.environ.get("XDG_RUNTIME_DIR")
+    if path and os.path.isdir(path):
+        return path
+    os.makedirs(CACHE_DIR, mode=0o700, exist_ok=True)  # private fallback; never a shared /tmp path
+    return CACHE_DIR
+
+
+SOCKET_PATH = os.path.join(runtime_dir(), "bosectl.sock")
+LOCK_PATH = SOCKET_PATH + ".lock"
+CLIENT_TIMEOUT = 60  # longest command (device connect) takes ~15 s
+WATCHER_SEND_TIMEOUT = 2
+IDLE_EXIT = 300  # seconds without watchers or requests before the daemon exits
+
+
+def code_version():
+    """Fingerprint of this code, so a daemon left over from an older plugin version gets replaced."""
+    digest = hashlib.sha1()
+    here = os.path.dirname(os.path.realpath(__file__))
+    for name in (os.path.realpath(__file__), os.path.join(here, "bmap.py")):
+        with open(name, "rb") as f:
+            digest.update(f.read())
+    return digest.hexdigest()[:16]
+
+
+CODE_VERSION = code_version()
+
+
+EVENT_KINDS = {(31, 3): "mode", (31, 4): "mode", (31, 6): "modes", (2, 2): "battery",
+               (5, 5): "volume", (1, 2): "name"}
+
+
+def event_kind(block, func):
+    if (block, func) in EVENT_KINDS:
+        return EVENT_KINDS[(block, func)]
+    return {1: "settings", 4: "devices", 31: "modes"}.get(block, "other")
+
+
+def is_disconnect(error):
+    return isinstance(error, (OSError, ConnectionLost))
+
+
+def connect_headset(address=None):
+    addr = address or find_headset()
+    channel = cached_channel(addr)
+    try:
+        bose = Bose(addr, channel)
+    except OSError:
+        if channel is None:
+            raise
+        bose = Bose(addr)  # cached channel went stale; rediscover via SDP
+    if bose.t.channel != channel:
+        save_channel(addr, bose.t.channel)
+    return bose
+
+
+def state_line(connected, state, error=None):
+    event = {"event": "state", "connected": connected and state is not None, "state": state}
+    if error:
+        event["error"] = error
+    return event
+
+
+class Daemon:
+    def __init__(self, address):
+        self.address = address.upper() if address else None
+        self.bose = None  # guarded by self.lock
+        self.lock = threading.Lock()
+        self.state = None
+        self.error = None
+        self.dirty = threading.Event()
+        self.events = queue.Queue()
+        self.watchers = []
+        self.watchers_lock = threading.Lock()
+        self.last_activity = time.monotonic()
+
+    # -- events to watchers
+
+    def broadcast(self, event):
+        # Never blocks: callers may hold self.lock; sender_loop does the socket writes.
+        self.events.put(event)
+
+    def state_event(self):
+        return state_line(self.bose is not None, self.state, self.error)
+
+    def shutdown(self):
+        os.kill(os.getpid(), signal.SIGTERM)  # handled on the main thread: removes the socket and exits
+
+    def idle_loop(self):
+        """Exit when nobody has used the daemon for a while, e.g. after the plugin was removed."""
+        while True:
+            time.sleep(30)
+            with self.watchers_lock:
+                watched = bool(self.watchers)
+            if watched:
+                self.last_activity = time.monotonic()
+            elif time.monotonic() - self.last_activity > IDLE_EXIT:
+                self.shutdown()
+
+    def sender_loop(self):
+        while True:
+            line = (json.dumps(self.events.get()) + "\n").encode()
+            with self.watchers_lock:
+                targets = list(self.watchers)
+            dead = []
+            for conn in targets:
+                try:
+                    conn.sendall(line)  # bounded by WATCHER_SEND_TIMEOUT; slow readers are dropped
+                except OSError:
+                    dead.append(conn)
+            if dead:
+                with self.watchers_lock:
+                    self.watchers = [c for c in self.watchers if c not in dead]
+                for conn in dead:
+                    conn.close()
+
+    def on_packet(self, pkt):
+        block, func, op = pkt[0], pkt[1], pkt[2] & 0x0F
+        if op == 3:  # STATUS pushed by the headset
+            self.broadcast({"event": event_kind(block, func), "block": block, "function": func,
+                            "payload": pkt[4:].hex()})
+            self.dirty.set()
+
+    # -- headset connection
+
+    def drop(self, reason):
+        """Close the headset link. Caller must hold self.lock."""
+        if self.bose is None:
+            return
+        try:
+            self.bose.close()
+        except OSError:
+            pass
+        self.bose = None
+        self.state = None
+        self.broadcast({"event": "disconnected", "reason": reason})
+        self.broadcast(self.state_event())
+
+    def headset_loop(self):
+        backoff = 2
+        while True:
+            with self.lock:
+                bose = self.bose
+            if bose is None:
+                try:
+                    bose = connect_headset(self.address)
+                    bose.on_unsolicited = self.on_packet
+                    try:
+                        bose.subscribe()
+                    except BmapError as e:
+                        if is_disconnect(e):
+                            raise
+                except Exception as e:
+                    setup_problem = str(e) if "bluetoothctl" in str(e) else None
+                    if setup_problem != self.error:
+                        self.error = setup_problem
+                        self.broadcast(self.state_event())
+                    time.sleep(backoff)
+                    backoff = min(backoff * 2, 30)
+                    continue
+                with self.lock:
+                    self.bose = bose
+                    self.error = None
+                backoff = 2
+                self.broadcast({"event": "connected", "address": bose.addr})
+                self.dirty.set()
+                continue
+            try:
+                with self.lock:
+                    pkt = self.bose.t.recv(0.2) if self.bose is bose else None
+                if pkt is not None:
+                    self.on_packet(pkt)
+                else:
+                    time.sleep(0.05)
+            except Exception as e:
+                with self.lock:
+                    if self.bose is bose:
+                        self.drop(str(e))
+
+    def refresh_loop(self):
+        """Push a full decoded state to watchers whenever something changed (debounced), and every minute.
+
+        The periodic push also reaches watchers while the headset is away, which prunes dead ones.
+        """
+        while True:
+            self.dirty.wait(timeout=60)
+            time.sleep(0.3)
+            self.dirty.clear()
+            with self.lock:
+                if self.bose is not None:
+                    try:
+                        self.state = status_data(self.bose)
+                        self.error = None
+                    except Exception as e:
+                        if is_disconnect(e):
+                            self.drop(str(e))
+                        else:
+                            self.error = str(e)  # keep the last good state; the link is still up
+                event = self.state_event()
+            self.broadcast(event)
+
+    # -- clients
+
+    def handle(self, conn):
+        keep_open, reply, args = False, None, None
+        try:
+            conn.settimeout(10)
+            with conn.makefile() as f:
+                request = json.loads(f.readline())
+            self.last_activity = time.monotonic()
+            if request.get("version", CODE_VERSION) != CODE_VERSION:
+                reply = {"stdout": "", "error": "bosectl daemon is outdated; restarting it", "code": 1,
+                         "restart": True}
+                threading.Timer(0.2, self.shutdown).start()
+                return
+            args = build_parser().parse_args(request["argv"])
+            if args.cmd == "daemon":
+                raise BmapError("daemon already running")
+            held = self.bose.addr.upper() if self.bose else self.address
+            if args.address and held and args.address.upper() != held:
+                raise BmapError(f"the running daemon controls {held}; stop it with "
+                                f"'pkill -f \"bosectl daemon\"' to use {args.address}")
+            if args.cmd == "watch":
+                conn.settimeout(WATCHER_SEND_TIMEOUT)
+                with self.watchers_lock:
+                    self.watchers.append(conn)
+                self.broadcast(self.state_event())
+                keep_open = True
+                return
+            out = io.StringIO()
+            try:
+                with self.lock:
+                    if self.bose is None:
+                        raise BmapError("headset not connected")
+                    try:
+                        # stdout redirection is process-wide; safe because commands run one at a time
+                        with contextlib.redirect_stdout(out):
+                            run(args, self.bose)
+                    except Exception as e:
+                        if is_disconnect(e):
+                            self.drop(str(e))
+                        raise
+            finally:
+                if args.cmd not in READ_ONLY:
+                    self.dirty.set()  # refresh watchers after a write, including failed ones
+            reply = {"stdout": out.getvalue(), "code": 0}
+        except SystemExit as e:  # argparse rejected the arguments
+            reply = {"stdout": "", "error": "invalid arguments", "code": e.code if isinstance(e.code, int) else 2}
+        except Exception as e:
+            reply = {"stdout": "", "error": str(e) or type(e).__name__, "code": 1}
+        finally:
+            if not keep_open:
+                try:
+                    if reply is not None:
+                        conn.sendall((json.dumps(reply) + "\n").encode())
+                except OSError:
+                    pass
+                conn.close()
+
+    def serve(self):
+        lock_fd = os.open(LOCK_PATH, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            sys.exit("bosectl: daemon already running")
+        # holding the lock means any existing socket file is stale
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(SOCKET_PATH)
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        old_umask = os.umask(0o077)
+        try:
+            server.bind(SOCKET_PATH)
+        finally:
+            os.umask(old_umask)
+        server.listen()
+        signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))  # run the finally below
+        for loop in (self.headset_loop, self.refresh_loop, self.sender_loop, self.idle_loop):
+            threading.Thread(target=loop, daemon=True).start()
+        try:
+            while True:
+                conn, _ = server.accept()
+                threading.Thread(target=self.handle, args=(conn,), daemon=True).start()
+        finally:
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(SOCKET_PATH)
+
+
+def daemon_running():
+    probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        probe.connect(SOCKET_PATH)
+        return True
+    except OSError:
+        return False
+    finally:
+        probe.close()
+
+
+def spawn_daemon(address=None):
+    """Start a detached daemon that outlives this process, then wait for its socket."""
+    cmd = [sys.executable, os.path.realpath(__file__)]
+    if address:
+        cmd += ["--address", address]
+    subprocess.Popen(cmd + ["daemon"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                     stderr=subprocess.DEVNULL, start_new_session=True, close_fds=True)
+    for _ in range(50):
+        if daemon_running():
+            return True
+        time.sleep(0.1)
+    return False
+
+
+class DaemonOutdated(Exception):
+    pass
+
+
+def via_daemon(argv, json_output, streaming):
+    """Run the command through a running daemon. Returns False if none is running."""
+    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        client.connect(SOCKET_PATH)
+    except OSError:
+        client.close()
+        return False
+    with client:
+        client.settimeout(None if streaming else CLIENT_TIMEOUT)
+        client.sendall((json.dumps({"argv": argv, "version": CODE_VERSION}) + "\n").encode())
+        try:
+            for line in client.makefile():
+                msg = json.loads(line)
+                if "event" in msg:  # watch stream
+                    print(json.dumps(msg), flush=True)
+                    continue
+                if msg.get("restart"):
+                    raise DaemonOutdated()
+                sys.stdout.write(msg["stdout"])
+                if msg.get("error"):
+                    raise BmapError(msg["error"])
+                sys.exit(msg["code"])
+        except TimeoutError:
+            raise BmapError("timed out waiting for the bosectl daemon") from None
+    if streaming:
+        raise BmapError("bosectl daemon stopped")
+    raise BmapError("bosectl daemon closed the connection without replying")
+
+
+def watch_direct(bose):
+    """`watch --no-daemon`: same state stream as the daemon, on this process's own connection."""
+    print(json.dumps(state_line(True, status_data(bose))), flush=True)
+    bose.subscribe()
+    for block, func, op, payload in bose.events():
+        if op == 3:
+            print(json.dumps({"event": event_kind(block, func), "block": block,
+                              "function": func, "payload": payload.hex()}), flush=True)
+            print(json.dumps(state_line(True, status_data(bose))), flush=True)
+
+
+def main():
+    argv = sys.argv[1:]
+    args = build_parser().parse_args(argv)
+    try:
+        if args.cmd == "daemon":
+            Daemon(args.address).serve()
+            return
+        watch = args.cmd == "watch"
+        if watch and args.no_daemon:
+            with connect_headset(args.address) as bose:
+                watch_direct(bose)
+            return
+        for attempt in range(2):
+            if watch and not daemon_running() and not spawn_daemon(args.address):
+                raise BmapError("could not start the bosectl daemon")
+            try:
+                if via_daemon(argv, args.json, streaming=watch):
+                    return
+                break
+            except DaemonOutdated:
+                for _ in range(50):  # wait for the old daemon to exit, then start over
+                    if not daemon_running():
+                        break
+                    time.sleep(0.1)
+        with connect_headset(args.address) as bose:
+            run(args, bose)
+    except (BmapError, OSError) as e:
+        if args.json:
+            print(json.dumps({"error": str(e)}))
+        sys.exit(f"bosectl: {e}")
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == "__main__":
+    main()

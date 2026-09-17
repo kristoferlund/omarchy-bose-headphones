@@ -1,0 +1,4 @@
+__pycache__/
+# local probing output and reference material
+research/*
+!research/*.py

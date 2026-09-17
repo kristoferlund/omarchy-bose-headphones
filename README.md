@@ -48,7 +48,6 @@ so the table can grow.
 
 ## Install
 
-
 ```sh
 omarchy plugin add https://github.com/kristoferlund/omarchy-bose-headphones.git --enable
 ```

@@ -147,6 +147,7 @@ on real hardware, and `research/` holds the scripts used to map the protocol.
 ```sh
 omarchy plugin validate .
 qmltestrunner -input tests -import "$OMARCHY_PATH/shell" -o -,txt
+python3 -m unittest discover -s tests -v
 python3 -m py_compile bmap.py bosectl
 ```
 

@@ -81,6 +81,11 @@ def cstr(b):
 
 # ---------------------------------------------------------------- transport
 
+# Service discovery should be small; bound both memory and peer-driven round trips.
+SDP_MAX_BYTES = 64 * 1024
+SDP_MAX_RESPONSES = 32
+
+
 def find_rfcomm_channel(addr, uuid16=0x1101):
     """SDP ServiceSearchAttribute for a 16-bit UUID; return its RFCOMM channel."""
     s = socket.socket(socket.AF_BLUETOOTH, socket.SOCK_SEQPACKET, socket.BTPROTO_L2CAP)
@@ -89,24 +94,44 @@ def find_rfcomm_channel(addr, uuid16=0x1101):
         s.connect((addr, 1))
         pattern = bytes([0x35, 3, 0x19]) + struct.pack(">H", uuid16)
         attrs = bytes([0x35, 5, 0x0A]) + struct.pack(">I", 0x0000FFFF)
-        raw, cont, tid = b"", b"\0", 1
-        while True:
+        raw, cont, seen = bytearray(), b"\0", set()
+        for tid in range(1, SDP_MAX_RESPONSES + 1):
             params = pattern + struct.pack(">H", 0xFFFF) + attrs + cont
             s.send(struct.pack(">BHH", 0x06, tid, len(params)) + params)
-            resp = s.recv(4096)
+            # One byte beyond the largest SDP PDU makes oversized packets fail
+            # length validation even if SOCK_SEQPACKET truncates the datagram.
+            resp = s.recv(5 + 0xFFFF + 1)
             if len(resp) < 8 or resp[0] != 0x07:
                 raise BmapError(f"unexpected SDP response from {addr}")
+            response_tid, param_len = struct.unpack(">HH", resp[1:5])
+            if response_tid != tid or param_len != len(resp) - 5:
+                raise BmapError(f"invalid SDP response header from {addr}")
             count = struct.unpack(">H", resp[5:7])[0]
-            raw += resp[7:7 + count]
-            cont, tid = resp[7 + count:], tid + 1
-            if not cont or cont[0] == 0:
+            end = 7 + count
+            if end >= len(resp):
+                raise BmapError(f"invalid SDP attribute byte count from {addr}")
+            cont = resp[end:]
+            if cont[0] > 16 or len(cont) != 1 + cont[0]:
+                raise BmapError(f"invalid SDP continuation state from {addr}")
+            if count == 0:
+                raise BmapError(f"SDP response made no progress from {addr}")
+            if len(raw) + count > SDP_MAX_BYTES:
+                raise BmapError(f"SDP byte limit exceeded from {addr}")
+            if cont[0]:
+                if cont in seen:
+                    raise BmapError(f"repeated SDP continuation state from {addr}")
+                if tid == SDP_MAX_RESPONSES:
+                    raise BmapError(f"SDP response limit exceeded from {addr}")
+                seen.add(cont)
+            raw.extend(resp[7:end])
+            if cont[0] == 0:
                 break
     finally:
         s.close()
     # RFCOMM protocol descriptor: DES(UUID16 0x0003, UINT8 channel)
     marker = bytes([0x19, 0x00, 0x03, 0x08])
     i = raw.find(marker)
-    if i < 0:
+    if i < 0 or i + len(marker) >= len(raw):
         raise BmapError(f"no RFCOMM service for UUID 0x{uuid16:04x} on {addr}")
     return raw[i + len(marker)]
 

@@ -190,6 +190,7 @@ class Bose:
         self.addr = addr
         self.on_unsolicited = None
         self._blocks = None
+        self._default_mode_unavailable = False
 
     def close(self):
         self.t.close()
@@ -357,7 +358,17 @@ class Bose:
         # with persistence on, the headset powers on in the last used mode and
         # DefaultMode just mirrors the active one; the default only matters when it's off
         persistence = self.try_get(AUDIO_MODES, 5)
-        default = None if persistence and persistence[0] else self.try_get(AUDIO_MODES, 4)
+        default = None
+        if not (persistence and persistence[0]) and not self._default_mode_unavailable:
+            try:
+                default = self.try_get(AUDIO_MODES, 4)
+            except BmapError as e:
+                # QC Ultra can leave this optional GET unanswered. Do not let
+                # missing power-on metadata hide otherwise usable modes. Retry
+                # on a new Bluetooth connection, not on every state refresh.
+                if e.code != 9:
+                    raise
+                self._default_mode_unavailable = True
         out = []
         for m in self.mode_slots():
             if m["empty"]:

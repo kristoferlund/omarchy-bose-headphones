@@ -2,6 +2,7 @@ import QtQuick
 import QtQuick.Controls
 import Quickshell.Io
 import qs.Commons
+import qs.Commons as Commons
 import qs.Ui
 import "Model.js" as Model
 
@@ -32,7 +33,7 @@ Panel {
   readonly property bool announceModes: setting("announceModes", true) !== false
   readonly property string helperPath: decodeURIComponent(
     String(Qt.resolvedUrl("bosectl")).replace(/^file:\/\//, ""))
-  readonly property color contentForeground: root.bar ? root.bar.foreground : Color.foreground
+  readonly property color contentForeground: root.bar ? root.bar.foreground : Commons.Color.foreground
   readonly property string contentFontFamily: root.bar ? root.bar.fontFamily : Style.font.family
   readonly property color dimForeground: Qt.darker(contentForeground, 1.4)
   readonly property var settingsState: headsetState ? headsetState.settings : null
@@ -189,7 +190,7 @@ Panel {
       root.connected = false
       var stderrText = String(watchError.text || "").trim().replace(/^bosectl:\s*/, "")
       if (exitCode !== 0)
-        root.streamError = stderrText !== "" ? stderrText : "Could not run bosectl with python3."
+        root.streamError = stderrText !== "" ? stderrText : "The Bose connection helper stopped (exit " + exitCode + ")."
       watchRestart.restart()
     }
   }
@@ -335,7 +336,7 @@ Panel {
             visible: text !== ""
             width: parent.width
             text: root.lastError !== "" ? root.lastError : (root.connected ? root.streamError : "")
-            color: root.bar ? root.bar.urgent : Color.urgent
+            color: root.bar ? root.bar.urgent : Commons.Color.urgent
             font.family: root.contentFontFamily
             font.pixelSize: Style.font.bodySmall
             wrapMode: Text.WordWrap
@@ -822,8 +823,8 @@ Panel {
     readonly property bool selected: root.selectedMode !== null && mode !== null && root.selectedMode.index === mode.index
     implicitHeight: rowContent.implicitHeight + Style.space(12)
     radius: Style.cornerRadius
-    color: selected ? Style.selectedFillFor(root.contentForeground, Color.accent)
-      : (rowMouse.containsMouse ? Style.hoverFillFor(root.contentForeground, Color.accent) : "transparent")
+    color: selected ? Style.selectedFillFor(root.contentForeground, Commons.Color.accent)
+      : (rowMouse.containsMouse ? Style.hoverFillFor(root.contentForeground, Commons.Color.accent) : "transparent")
 
     Item {
       id: rowContent
@@ -841,7 +842,7 @@ Panel {
         width: Style.space(30)
         horizontalAlignment: Text.AlignHCenter
         text: row.mode ? Model.iconGlyph(row.mode.icon) : ""
-        color: row.mode && row.mode.active ? Color.accent : root.contentForeground
+        color: row.mode && row.mode.active ? Commons.Color.accent : root.contentForeground
         font.family: root.contentFontFamily
         font.pixelSize: Style.font.iconLarge
         textFormat: Text.PlainText
@@ -883,7 +884,7 @@ Panel {
         anchors.right: parent.right
         anchors.verticalCenter: parent.verticalCenter
         text: row.mode && row.mode.active ? "ACTIVE" : ""
-        color: Color.accent
+        color: Commons.Color.accent
         font.family: root.contentFontFamily
         font.pixelSize: Style.font.caption
         font.bold: true

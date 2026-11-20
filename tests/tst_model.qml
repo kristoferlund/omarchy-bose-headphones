@@ -80,7 +80,9 @@ TestCase {
     compare(Model.disconnectedMessage(true, ""), "Looking for your headphones…")
     verify(Model.disconnectedMessage(false, "").indexOf("Turn on your Bose headphones") === 0)
     verify(Model.disconnectedMessage(false, "bluetoothctl not found; install BlueZ").indexOf("install BlueZ") > 0)
-    verify(Model.disconnectedMessage(false, "Could not run bosectl with python3.").indexOf("pacman") > 0)
+    compare(Model.disconnectedMessage(false, "python3: can't open file: No such file"),
+            "python3: can't open file: No such file")
+    compare(Model.disconnectedMessage(false, "timeout waiting for 31.4"), "timeout waiting for 31.4")
   }
 
   function test_icons() {

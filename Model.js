@@ -94,9 +94,9 @@ function parseWatchLine(line) {
 
 // Why the widget can't reach the headset, as shown in the panel.
 function disconnectedMessage(loading, error) {
-  if (error.indexOf("bluetoothctl") !== -1) return error
-  if (error.indexOf("python3") !== -1 || error.indexOf("No such file") !== -1)
-    return "Python 3 is needed to talk to the headset. Install it with: sudo pacman -S --needed python"
+  // A Python process can fail for many reasons besides a missing interpreter.
+  // Preserve the actual diagnostic, including Bluetooth protocol timeouts.
+  if (error) return String(error)
   if (loading) return "Looking for your headphones…"
   return "Turn on your Bose headphones and connect them over Bluetooth. The widget reconnects automatically."
 }
